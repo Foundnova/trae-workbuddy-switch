@@ -49,19 +49,51 @@ pub fn reasoning_delta<'a>(sent: &str, fragment: &'a str) -> &'a str {
 ///
 /// 注意：顶层常规元数据（`id`、`model`、`created`、`object`）在流式分片中普遍存在，
 /// 不阻碍丢帧；首帧由于初始 `sent` 为空必会下发，因此客户端不会缺失 `id` 与 `model`。
+/// 检查经过差分改写后的帧是否应该被整帧丢弃。
+///
+/// 丢弃条件：所有 choice 均无任何有意义的 delta 增量（无非空 role、content、
+/// reasoning_content、tool_calls、function_call），且无非空 `finish_reason`，
+/// 且无非 null 的 `usage`。
 fn should_drop_frame(value: &Value) -> bool {
     let choices_all_empty = if let Some(choices) = value.get("choices").and_then(Value::as_array) {
         if choices.is_empty() {
             true
         } else {
             choices.iter().all(|choice| {
-                let delta_empty = match choice.get("delta") {
-                    Some(Value::Object(map)) => map.is_empty(),
+                let finish_reason_empty = match choice.get("finish_reason") {
+                    Some(Value::String(s)) => s.is_empty(),
                     Some(Value::Null) | None => true,
                     _ => false,
                 };
-                let finish_reason_empty = match choice.get("finish_reason") {
-                    Some(Value::String(s)) => s.is_empty(),
+                let delta_empty = match choice.get("delta") {
+                    Some(Value::Object(map)) => {
+                        let has_role = map
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .map_or(false, |s| !s.is_empty());
+                        let has_content = map
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .map_or(false, |s| !s.is_empty());
+                        let has_reasoning = map
+                            .get("reasoning_content")
+                            .or_else(|| map.get("reasoning"))
+                            .and_then(Value::as_str)
+                            .map_or(false, |s| !s.is_empty());
+                        let has_tool_calls = map
+                            .get("tool_calls")
+                            .and_then(Value::as_array)
+                            .map_or(false, |arr| !arr.is_empty());
+                        let has_function_call = match map.get("function_call") {
+                            Some(Value::Object(fc)) => {
+                                let name = fc.get("name").and_then(Value::as_str).unwrap_or("");
+                                let args = fc.get("arguments").and_then(Value::as_str).unwrap_or("");
+                                !name.is_empty() || !args.is_empty()
+                            }
+                            _ => false,
+                        };
+                        !has_role && !has_content && !has_reasoning && !has_tool_calls && !has_function_call
+                    }
                     Some(Value::Null) | None => true,
                     _ => false,
                 };
@@ -85,11 +117,13 @@ fn should_drop_frame(value: &Value) -> bool {
     true
 }
 
-/// SSE 流改写包装：将快照式的 `reasoning_content` 改写为增量分片。
+/// SSE 流改写包装：将快照式的 `reasoning_content` 改写为增量分片，
+/// 并规范化 delta 字段（剥离空 `tool_calls: []` 等畸形占位），防止下游客户端异常。
 pub struct ReasoningDelta<S> {
     inner: Pin<Box<S>>,
     buffer: Vec<u8>,
     sent: HashMap<i64, String>,
+    sent_role: bool,
     pending: VecDeque<Bytes>,
     frame_lines: Vec<Bytes>,
     frame_has_data: bool,
@@ -104,6 +138,7 @@ impl<S> ReasoningDelta<S> {
             inner: Box::pin(inner),
             buffer: Vec::new(),
             sent: HashMap::new(),
+            sent_role: false,
             pending: VecDeque::new(),
             frame_lines: Vec::new(),
             frame_has_data: false,
@@ -179,8 +214,7 @@ impl<S> ReasoningDelta<S> {
             self.frame_has_data = true;
             let payload = rest.trim();
 
-            // 快路径：非 JSON 或不含 reasoning_content，直接透传原始行
-            if payload == "[DONE]" || payload.is_empty() || !payload.contains("reasoning_content") {
+            if payload == "[DONE]" || payload.is_empty() {
                 self.frame_data_kept += 1;
                 self.frame_lines.push(Bytes::copy_from_slice(line));
                 return;
@@ -192,7 +226,8 @@ impl<S> ReasoningDelta<S> {
                 return;
             };
 
-            let mut has_reasoning = false;
+            let mut has_role_in_frame = false;
+
             if let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) {
                 for (i, choice) in choices.iter_mut().enumerate() {
                     let index = choice
@@ -200,13 +235,47 @@ impl<S> ReasoningDelta<S> {
                         .and_then(Value::as_i64)
                         .unwrap_or(i as i64);
                     if let Some(delta) = choice.get_mut("delta").and_then(Value::as_object_mut) {
+                        // 1. 消除空 tool_calls / null tool_calls，杜绝客户端（如 ZCode/@ai-sdk）
+                        // 因 `delta.tool_calls != null` 误判「工具调用开始」而强行提前结束思考块
+                        if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                            if tool_calls.is_empty() {
+                                delta.remove("tool_calls");
+                            }
+                        }
+                        if delta.get("tool_calls") == Some(&Value::Null) {
+                            delta.remove("tool_calls");
+                        }
+
+                        // 2. 清理无意义的 null/空占位字段，避免客户端解析混乱
+                        if delta.get("extra_fields") == Some(&Value::Null) {
+                            delta.remove("extra_fields");
+                        }
+                        if delta.get("function_call") == Some(&Value::Null) {
+                            delta.remove("function_call");
+                        }
+                        if delta.get("refusal").and_then(Value::as_str) == Some("") {
+                            delta.remove("refusal");
+                        }
+
+                        // 3. 检查并记录 role
+                        if let Some(role) = delta.get("role").and_then(Value::as_str) {
+                            if !role.is_empty() {
+                                has_role_in_frame = true;
+                                self.sent_role = true;
+                            }
+                        }
+
+                        // 4. 快照差分改写 reasoning_content
                         if let Some(frag) = delta.get("reasoning_content").and_then(Value::as_str) {
-                            has_reasoning = true;
                             let sent_entry = self.sent.entry(index).or_default();
                             let delta_text = reasoning_delta(sent_entry, frag);
                             if !delta_text.is_empty() {
                                 sent_entry.push_str(delta_text);
                                 delta.insert("reasoning_content".to_string(), json!(delta_text));
+                                // 思考阶段若附带空 content:"" 占位符，予以剥离以防客户端误触内容流
+                                if delta.get("content").and_then(Value::as_str) == Some("") {
+                                    delta.remove("content");
+                                }
                             } else {
                                 delta.remove("reasoning_content");
                             }
@@ -215,19 +284,26 @@ impl<S> ReasoningDelta<S> {
                 }
             }
 
-            if !has_reasoning {
-                self.frame_data_kept += 1;
-                self.frame_lines.push(Bytes::copy_from_slice(line));
-                return;
-            }
-
             if should_drop_frame(&value) {
-                // 冗余帧丢弃：不增加 frame_data_kept，不推入 frame_lines
+                // 冗余帧/全空占位帧丢弃：不增加 frame_data_kept，不推入 frame_lines
                 return;
             }
 
+            // 若首帧尚未下发 role，且本帧即将下发有意义的思考或内容，为首个 choice 补齐 role:"assistant"
+            if !self.sent_role && !has_role_in_frame {
+                if let Some(choices) = value.get_mut("choices").and_then(Value::as_array_mut) {
+                    if let Some(choice) = choices.first_mut() {
+                        if let Some(delta) = choice.get_mut("delta").and_then(Value::as_object_mut) {
+                            delta.insert("role".to_string(), json!("assistant"));
+                            self.sent_role = true;
+                        }
+                    }
+                }
+            }
+
+            let line_ending = if line.ends_with(b"\r\n") { "\r\n" } else { "\n" };
             let rewritten = match serde_json::to_string(&value) {
-                Ok(json_str) => format!("data: {json_str}\n"),
+                Ok(json_str) => format!("data: {json_str}{line_ending}"),
                 Err(_) => {
                     self.frame_data_kept += 1;
                     self.frame_lines.push(Bytes::copy_from_slice(line));
@@ -538,5 +614,64 @@ mod tests {
         let val3: Value = serde_json::from_str(events[2].strip_prefix("data: ").unwrap()).unwrap();
         assert_eq!(val3["usage"]["total_tokens"], 100);
         assert!(val3["choices"][0]["delta"].get("reasoning_content").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_workbuddy_real_world_chunks_cleaned_and_deduped() {
+        // 模拟真实上游 WorkBuddy 下发的分片序列：
+        // 1. 首帧：声明 role:"assistant"，带空 tool_calls:[] 及各种占位字段
+        // 2. 思考帧：累积快照，带 content:"" 与 tool_calls:[]
+        // 3. 重复思考快照帧：应整帧丢弃
+        // 4. 空过渡帧：无思考无内容，应整帧丢弃
+        // 5. 正文帧：带 content:"Hi"，带空 tool_calls:[]
+        // 6. 结束帧：带 finish_reason:"stop" 与 usage
+        let input = vec![
+            chunk("data: {\"choices\":[{\"delta\":{\"content\":\"\",\"extra_fields\":null,\"function_call\":null,\"refusal\":\"\",\"role\":\"assistant\",\"tool_calls\":[]},\"finish_reason\":\"\",\"index\":0,\"logprobs\":null}],\"created\":1791851944,\"id\":\"chunk-0\",\"model\":\"kimi-k3-1\",\"object\":\"chat.completion.chunk\",\"usage\":null}\n\n"),
+            chunk("data: {\"choices\":[{\"delta\":{\"content\":\"\",\"extra_fields\":null,\"function_call\":null,\"reasoning_content\":\"The\",\"refusal\":\"\",\"tool_calls\":[]},\"finish_reason\":\"\",\"index\":0,\"logprobs\":null}],\"created\":1791851944,\"id\":\"chunk-1\",\"model\":\"kimi-k3-1\",\"object\":\"chat.completion.chunk\",\"usage\":null}\n\n"),
+            chunk("data: {\"choices\":[{\"delta\":{\"content\":\"\",\"extra_fields\":null,\"function_call\":null,\"reasoning_content\":\"The user\",\"refusal\":\"\",\"tool_calls\":[]},\"finish_reason\":\"\",\"index\":0,\"logprobs\":null}],\"created\":1791851944,\"id\":\"chunk-2\",\"model\":\"kimi-k3-1\",\"object\":\"chat.completion.chunk\",\"usage\":null}\n\n"),
+            // 重复快照：应整帧丢弃
+            chunk("data: {\"choices\":[{\"delta\":{\"content\":\"\",\"extra_fields\":null,\"function_call\":null,\"reasoning_content\":\"The user\",\"refusal\":\"\",\"tool_calls\":[]},\"finish_reason\":\"\",\"index\":0,\"logprobs\":null}],\"created\":1791851944,\"id\":\"chunk-dup\",\"model\":\"kimi-k3-1\",\"object\":\"chat.completion.chunk\",\"usage\":null}\n\n"),
+            // 空过渡帧：应整帧丢弃
+            chunk("data: {\"choices\":[{\"delta\":{\"content\":\"\",\"extra_fields\":null,\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[]},\"finish_reason\":\"\",\"index\":0,\"logprobs\":null}],\"created\":1791851944,\"id\":\"chunk-trans\",\"model\":\"kimi-k3-1\",\"object\":\"chat.completion.chunk\",\"usage\":null}\n\n"),
+            chunk("data: {\"choices\":[{\"delta\":{\"content\":\"Hi\",\"extra_fields\":null,\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[]},\"finish_reason\":\"\",\"index\":0,\"logprobs\":null}],\"created\":1791851944,\"id\":\"chunk-3\",\"model\":\"kimi-k3-1\",\"object\":\"chat.completion.chunk\",\"usage\":null}\n\n"),
+            chunk("data: {\"choices\":[{\"delta\":{\"content\":\"!\",\"extra_fields\":null,\"function_call\":null,\"refusal\":\"\",\"tool_calls\":[]},\"finish_reason\":\"stop\",\"index\":0,\"logprobs\":null}],\"created\":1791851944,\"id\":\"chunk-4\",\"model\":\"kimi-k3-1\",\"object\":\"chat.completion.chunk\",\"usage\":{\"total_tokens\":10}}\n\n"),
+            chunk("data: [DONE]\n\n"),
+        ];
+
+        let stream = ReasoningDelta::new(futures_util::stream::iter(input));
+        let events = collect_stream_lines(stream).await;
+
+        // 验证：
+        // 1. 重复快照与空过渡帧被剔除：保留首帧、2个思考帧、2个正文帧、1个DONE帧 = 6帧
+        assert_eq!(events.len(), 6, "帧数应精准为 6（重复与空过渡被丢弃）: {events:?}");
+
+        // 2. 检查每一帧，绝不包含 `"tool_calls":[]`
+        for (i, ev) in events.iter().enumerate() {
+            assert!(!ev.contains("\"tool_calls\":[]"), "第 {i} 帧不应包含空 tool_calls: {ev}");
+            assert!(!ev.contains("\"tool_calls\": []"), "第 {i} 帧不应包含空 tool_calls: {ev}");
+        }
+
+        // 3. 检查首帧包含 role:"assistant"
+        let v0: Value = serde_json::from_str(events[0].strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(v0["choices"][0]["delta"]["role"], "assistant");
+
+        // 4. 检查思考帧差分为增量，且不含 content:""
+        let v1: Value = serde_json::from_str(events[1].strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(v1["choices"][0]["delta"]["reasoning_content"], "The");
+        assert!(v1["choices"][0]["delta"].get("content").is_none());
+
+        let v2: Value = serde_json::from_str(events[2].strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(v2["choices"][0]["delta"]["reasoning_content"], " user");
+        assert!(v2["choices"][0]["delta"].get("content").is_none());
+
+        // 5. 检查正文帧正常
+        let v3: Value = serde_json::from_str(events[3].strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(v3["choices"][0]["delta"]["content"], "Hi");
+
+        let v4: Value = serde_json::from_str(events[4].strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(v4["choices"][0]["delta"]["content"], "!");
+        assert_eq!(v4["choices"][0]["finish_reason"], "stop");
+
+        assert_eq!(events[5], "data: [DONE]\n\n");
     }
 }
